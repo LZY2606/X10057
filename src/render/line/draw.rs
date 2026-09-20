@@ -269,7 +269,7 @@ fn draw_progress_bar(p: &Value, style: Style, mut blocks_available: u16, colored
 fn progress_style(p: &Value) -> Style {
     use crate::progress::State::*;
     match p.state {
-        Running => if let Some(fraction) = p.fraction() {
+        Running | Completed => if let Some(fraction) = p.fraction() {
             if fraction > 0.8 { Color::Green } else { Color::Yellow }
         } else {
             Color::White

@@ -100,8 +100,8 @@ pub(crate) fn headline(
     let (num_running_tasks, num_blocked_tasks, num_groups) = entries.iter().fold(
         (0, 0, 0),
         |(mut running, mut blocked, mut groups), (_key, Task { progress, .. })| {
-            match progress.as_ref().map(|p| p.state) {
-                Some(progress::State::Running) => running += 1,
+            match progress.as_ref().map(|p| p.state.clone()) {
+                Some(progress::State::Running) | Some(progress::State::Completed) => running += 1,
                 Some(progress::State::Blocked(_, _)) | Some(progress::State::Halted(_, _)) => blocked += 1,
                 None => groups += 1,
             }
@@ -238,15 +238,15 @@ pub fn draw_progress(
         draw_text_with_ellipsis_nowrap(line_bound, buf, tree_prefix, None);
         match progress
             .as_ref()
-            .map(|p| (p.fraction(), p.state, p.step.load(Ordering::SeqCst)))
+            .map(|p| (p.fraction(), p.state.clone(), p.step.load(Ordering::SeqCst)))
         {
             Some((Some(fraction), state, _step)) => {
                 let mut progress_text = progress_text;
-                add_block_eta(state, &mut progress_text);
+                add_block_eta(&state, &mut progress_text);
                 let (bound, style) = draw_progress_bar_fn(buf, progress_rect, fraction, |fraction| match state {
                     progress::State::Blocked(_, _) => Color::Red,
                     progress::State::Halted(_, _) => Color::LightRed,
-                    progress::State::Running => {
+                    progress::State::Running | progress::State::Completed => {
                         if fraction >= 0.8 {
                             Color::Green
                         } else {
@@ -261,7 +261,7 @@ pub fn draw_progress(
             }
             Some((None, state, step)) => {
                 let mut progress_text = progress_text;
-                add_block_eta(state, &mut progress_text);
+                add_block_eta(&state, &mut progress_text);
                 draw_text_with_ellipsis_nowrap(progress_rect, buf, progress_text, None);
                 let bar_rect = rect::offset_x(line_bound, max_progress_label_width as u16);
                 draw_spinner(
@@ -272,7 +272,7 @@ pub fn draw_progress(
                     match state {
                         progress::State::Blocked(_, _) => Color::Red,
                         progress::State::Halted(_, _) => Color::LightRed,
-                        progress::State::Running => Color::White,
+                        progress::State::Running | progress::State::Completed => Color::White,
                     },
                 );
             }
@@ -285,14 +285,14 @@ pub fn draw_progress(
     }
 }
 
-fn add_block_eta(state: progress::State, progress_text: &mut String) {
+fn add_block_eta(state: &progress::State, progress_text: &mut String) {
     match state {
         progress::State::Blocked(reason, maybe_eta) | progress::State::Halted(reason, maybe_eta) => {
             progress_text.push_str(" [");
             progress_text.push_str(reason);
             progress_text.push(']');
             if let Some(eta) = maybe_eta {
-                let eta = jiff::Timestamp::try_from(eta).expect("reasonable system time");
+                let eta = jiff::Timestamp::try_from(*eta).expect("reasonable system time");
                 let now = jiff::Timestamp::now();
                 if eta > now {
                     use std::fmt::Write;
@@ -300,7 +300,7 @@ fn add_block_eta(state: progress::State, progress_text: &mut String) {
                         progress_text,
                         " → {:#} to {}",
                         eta.duration_since(now),
-                        if let progress::State::Blocked(_, _) = state {
+                        if matches!(state, progress::State::Blocked(_, _)) {
                             "unblock"
                         } else {
                             "continue"
@@ -310,7 +310,7 @@ fn add_block_eta(state: progress::State, progress_text: &mut String) {
                 }
             }
         }
-        progress::State::Running => {}
+        progress::State::Running | progress::State::Completed => {}
     }
 }
 

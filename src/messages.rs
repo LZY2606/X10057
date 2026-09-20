@@ -46,8 +46,21 @@ impl MessageRingBuffer {
 
     /// Push a `message` from `origin` at severity `level` into the buffer, possibly overwriting the last message added.
     pub fn push_overwrite(&mut self, level: MessageLevel, origin: String, message: impl Into<String>) {
+        self.push_overwrite_at(SystemTime::now(), level, origin, message)
+    }
+
+    /// Like [`push_overwrite`][Self::push_overwrite], but with an explicit timestamp instead of
+    /// the wall clock. Used when restoring or monotonically merging a snapshot so that replay
+    /// does not rewrite history with newer timestamps.
+    pub fn push_overwrite_at(
+        &mut self,
+        time: SystemTime,
+        level: MessageLevel,
+        origin: String,
+        message: impl Into<String>,
+    ) {
         let msg = Message {
-            time: SystemTime::now(),
+            time,
             level,
             origin,
             message: message.into(),
@@ -59,6 +72,11 @@ impl MessageRingBuffer {
             self.cursor = (self.cursor + 1) % self.buf.len();
         }
         self.total = self.total.wrapping_add(1);
+    }
+
+    /// Return true if `message` is currently contained in the buffer.
+    pub fn contains(&self, message: &Message) -> bool {
+        self.buf.iter().any(|m| m == message)
     }
 
     /// Copy all messages currently contained in the buffer to `out`.

@@ -1,14 +1,8 @@
 use std::{
     fmt::Debug,
-    ops::Deref,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
     time::SystemTime,
 };
-
-use parking_lot::Mutex;
 
 use crate::{
     messages::MessageLevel,
@@ -19,7 +13,9 @@ use crate::{
 
 impl Drop for Item {
     fn drop(&mut self) {
-        self.tree.remove(&self.key);
+        if self.is_attached() && self.key != crate::progress::Key::default() {
+            self.shared.tree.remove(&self.key);
+        }
     }
 }
 
@@ -47,9 +43,12 @@ impl Item {
     ///
     /// **Note** that this method can be called multiple times, changing the bounded-ness and unit at will.
     pub fn init(&self, max: Option<usize>, unit: Option<Unit>) {
+        if !self.is_attached() || self.is_terminal() {
+            return;
+        }
         #[cfg(feature = "progress-tree-hp-hashmap")]
         {
-            if let Some(mut r) = self.tree.get_mut(&self.key) {
+            if let Some(mut r) = self.tree().get_mut(&self.key) {
                 self.value.store(0, Ordering::SeqCst);
                 r.value_mut().progress = (max.is_some() || unit.is_some()).then(|| Value {
                     done_at: max,
@@ -61,7 +60,7 @@ impl Item {
         }
         #[cfg(not(feature = "progress-tree-hp-hashmap"))]
         {
-            self.tree.get_mut(&self.key, |v| {
+            self.tree().get_mut(&self.key, |v| {
                 self.value.store(0, Ordering::SeqCst);
                 v.progress = (max.is_some() || unit.is_some()).then(|| Value {
                     done_at: max,
@@ -73,37 +72,46 @@ impl Item {
         }
     }
 
-    fn alter_progress(&self, f: impl FnMut(&mut Value)) {
+    fn alter_progress(&self, mut f: impl FnMut(&mut Value)) {
+        if !self.is_attached() {
+            return;
+        }
         #[cfg(feature = "progress-tree-hp-hashmap")]
         {
-            if let Some(mut r) = self.tree.get_mut(&self.key) {
-                // NOTE: since we wrap around, if there are more tasks than we can have IDs for,
-                // and if all these tasks are still alive, two progress trees may see the same ID
-                // when these go out of scope, they delete the key and the other tree will not find
-                // its value anymore. Besides, it's probably weird to see tasks changing their progress
-                // all the time…
-                r.value_mut().progress.as_mut().map(f);
+            if let Some(mut r) = self.tree().get_mut(&self.key) {
+                if let Some(value) = r.value_mut().progress.as_mut() {
+                    if !value.state.is_terminal() {
+                        f(value);
+                    }
+                }
             };
         }
         #[cfg(not(feature = "progress-tree-hp-hashmap"))]
         {
-            self.tree.get_mut(&self.key, |v| {
-                v.progress.as_mut().map(f);
+            self.tree().get_mut(&self.key, |v| {
+                if let Some(value) = v.progress.as_mut() {
+                    if !value.state.is_terminal() {
+                        f(value);
+                    }
+                }
             });
         }
     }
 
     /// Set the name of this task's progress to the given `name`.
     pub fn set_name(&self, name: impl Into<String>) {
+        if !self.is_attached() {
+            return;
+        }
         #[cfg(feature = "progress-tree-hp-hashmap")]
         {
-            if let Some(mut r) = self.tree.get_mut(&self.key) {
+            if let Some(mut r) = self.tree().get_mut(&self.key) {
                 r.value_mut().name = name.into();
             };
         }
         #[cfg(not(feature = "progress-tree-hp-hashmap"))]
         {
-            self.tree.get_mut(&self.key, |v| {
+            self.tree().get_mut(&self.key, |v| {
                 v.name = name.into();
             });
         }
@@ -113,11 +121,11 @@ impl Item {
     pub fn name(&self) -> Option<String> {
         #[cfg(feature = "progress-tree-hp-hashmap")]
         {
-            self.tree.get(&self.key).map(|r| r.value().name.to_owned())
+            self.tree().get(&self.key).map(|r| r.value().name.to_owned())
         }
         #[cfg(not(feature = "progress-tree-hp-hashmap"))]
         {
-            self.tree.get(&self.key, |v| v.name.to_owned())
+            self.tree().get(&self.key, |v| v.name.to_owned())
         }
     }
 
@@ -125,14 +133,14 @@ impl Item {
     pub fn id(&self) -> Id {
         #[cfg(feature = "progress-tree-hp-hashmap")]
         {
-            self.tree
+            self.tree()
                 .get(&self.key)
                 .map(|r| r.value().id)
                 .unwrap_or(crate::progress::UNKNOWN)
         }
         #[cfg(not(feature = "progress-tree-hp-hashmap"))]
         {
-            self.tree.get(&self.key, |v| v.id).unwrap_or(crate::progress::UNKNOWN)
+            self.tree().get(&self.key, |v| v.id).unwrap_or(crate::progress::UNKNOWN)
         }
     }
 
@@ -145,13 +153,13 @@ impl Item {
     pub fn max(&self) -> Option<Step> {
         #[cfg(feature = "progress-tree-hp-hashmap")]
         {
-            self.tree
+            self.tree()
                 .get(&self.key)
                 .and_then(|r| r.value().progress.as_ref().and_then(|p| p.done_at))
         }
         #[cfg(not(feature = "progress-tree-hp-hashmap"))]
         {
-            self.tree
+            self.tree()
                 .get(&self.key, |v| v.progress.as_ref().and_then(|p| p.done_at))
                 .flatten()
         }
@@ -159,9 +167,12 @@ impl Item {
 
     /// Set the maximum value to `max` and return the old maximum value.
     pub fn set_max(&self, max: Option<Step>) -> Option<Step> {
+        if !self.is_attached() {
+            return None;
+        }
         #[cfg(feature = "progress-tree-hp-hashmap")]
         {
-            self.tree
+            self.tree()
                 .get_mut(&self.key)?
                 .value_mut()
                 .progress
@@ -174,7 +185,7 @@ impl Item {
         }
         #[cfg(not(feature = "progress-tree-hp-hashmap"))]
         {
-            self.tree
+            self.tree()
                 .get_mut(&self.key, |v| {
                     v.progress.as_mut().and_then(|p| {
                         let prev = p.done_at;
@@ -190,13 +201,13 @@ impl Item {
     pub fn unit(&self) -> Option<Unit> {
         #[cfg(feature = "progress-tree-hp-hashmap")]
         {
-            self.tree
+            self.tree()
                 .get(&self.key)
                 .and_then(|r| r.value().progress.as_ref().and_then(|p| p.unit.clone()))
         }
         #[cfg(not(feature = "progress-tree-hp-hashmap"))]
         {
-            self.tree
+            self.tree()
                 .get(&self.key, |v| v.progress.as_ref().and_then(|p| p.unit.clone()))
                 .flatten()
         }
@@ -204,8 +215,13 @@ impl Item {
 
     /// Set the current progress to the given `step`.
     ///
-    /// **Note**: that this call has no effect unless `init(…)` was called before.
+    /// **Note**: that this call has no effect unless `init(…)` was called before. It also has no
+    /// effect on handles that were detached by a snapshot restore or on finished items, so progress
+    /// can never move backwards.
     pub fn set(&self, step: Step) {
+        if !self.is_attached() || self.is_terminal() {
+            return;
+        }
         self.value.store(step, Ordering::SeqCst);
     }
 
@@ -213,6 +229,9 @@ impl Item {
     ///
     /// **Note**: that this call has no effect unless `init(…)` was called before.
     pub fn inc_by(&self, step: Step) {
+        if !self.is_attached() || self.is_terminal() {
+            return;
+        }
         self.value.fetch_add(step, Ordering::Relaxed);
     }
 
@@ -220,6 +239,9 @@ impl Item {
     ///
     /// **Note**: that this call has no effect unless `init(…)` was called before.
     pub fn inc(&self) {
+        if !self.is_attached() || self.is_terminal() {
+            return;
+        }
         self.value.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -232,7 +254,7 @@ impl Item {
     ///
     /// The halted-state is undone next time [`tree::Item::running(…)`][Item::running()] is called.
     pub fn blocked(&self, reason: &'static str, eta: Option<SystemTime>) {
-        self.alter_progress(|p| p.state = State::Blocked(reason, eta));
+        self.alter_progress(|p| p.state = State::Blocked(reason.into(), eta));
     }
 
     /// Call to indicate that progress cannot be indicated, even though the task can be interrupted.
@@ -244,7 +266,7 @@ impl Item {
     ///
     /// The halted-state is undone next time [`tree::Item::running(…)`][Item::running()] is called.
     pub fn halted(&self, reason: &'static str, eta: Option<SystemTime>) {
-        self.alter_progress(|p| p.state = State::Halted(reason, eta));
+        self.alter_progress(|p| p.state = State::Halted(reason.into(), eta));
     }
 
     /// Call to indicate that progress is back in running state, which should be called after the reason for
@@ -268,23 +290,49 @@ impl Item {
     /// Exceeding the level will be ignored, and new tasks will be added to this instance's
     /// level instead.
     pub fn add_child_with_id(&mut self, name: impl Into<String>, id: Id) -> Item {
-        let child_key = self.key.add_child(self.highest_child_id);
+        // The root keeps its counter in shared root state (as it always did); other parents keep
+        // theirs in the per-parent table, so counters survive snapshot restore and merge.
+        let next_child_id = |item: &Item| {
+            if item.key == crate::progress::Key::default() {
+                let mut next = item.shared.root_next_child.lock();
+                let child_id = *next;
+                *next = next.wrapping_add(1);
+                child_id
+            } else {
+                let mut counters = item.shared.next_child.lock();
+                let next = counters.entry(item.key).or_insert(0);
+                let child_id = *next;
+                *next = next.wrapping_add(1);
+                child_id
+            }
+        };
+        if !self.is_attached() {
+            // This handle belongs to a tree that was superseded by a snapshot restore. The new
+            // child stays detached (using the stale handle's own counter) and cannot mutate the
+            // current tree at all.
+            let detached_key = self.key.add_child(self.highest_child_id);
+            self.highest_child_id = self.highest_child_id.wrapping_add(1);
+            return Item {
+                highest_child_id: 0,
+                value: Default::default(),
+                key: detached_key,
+                shared: Arc::clone(&self.shared),
+                generation: self.generation,
+            };
+        }
+        let child_key = self.key.add_child(next_child_id(self));
         let task = Task {
             name: name.into(),
             id,
             progress: None,
         };
-        #[cfg(feature = "progress-tree-hp-hashmap")]
-        self.tree.insert(child_key, task);
-        #[cfg(not(feature = "progress-tree-hp-hashmap"))]
-        self.tree.insert(child_key, task);
-        self.highest_child_id = self.highest_child_id.wrapping_add(1);
+        self.shared.tree.insert(child_key, task);
         Item {
             highest_child_id: 0,
             value: Default::default(),
             key: child_key,
-            tree: Arc::clone(&self.tree),
-            messages: Arc::clone(&self.messages),
+            shared: Arc::clone(&self.shared),
+            generation: self.generation,
         }
     }
 
@@ -294,17 +342,33 @@ impl Item {
     /// made, including indicating success or failure.
     pub fn message(&self, level: MessageLevel, message: impl Into<String>) {
         let message: String = message.into();
-        self.messages.lock().push_overwrite(
+        if !self.is_attached() {
+            // Detached handles still log if logging is enabled, but must not write into the ring
+            // buffer of the tree that superseded them.
+            #[cfg(feature = "progress-tree-log")]
+            match level {
+                MessageLevel::Failure => crate::warn!("{}", message),
+                MessageLevel::Info | MessageLevel::Success => crate::info!("{}", message),
+            };
+            return;
+        }
+        let now = self.shared.now();
+        self.shared.messages.lock().push_overwrite_at(
+            now,
             level,
             {
                 let name;
                 #[cfg(feature = "progress-tree-hp-hashmap")]
                 {
-                    name = self.tree.get(&self.key).map(|v| v.name.to_owned()).unwrap_or_default();
+                    name = self
+                        .tree()
+                        .get(&self.key)
+                        .map(|v| v.name.to_owned())
+                        .unwrap_or_default();
                 }
                 #[cfg(not(feature = "progress-tree-hp-hashmap"))]
                 {
-                    name = self.tree.get(&self.key, |v| v.name.to_owned()).unwrap_or_default()
+                    name = self.tree().get(&self.key, |v| v.name.to_owned()).unwrap_or_default()
                 }
 
                 #[cfg(feature = "progress-tree-log")]
@@ -319,8 +383,12 @@ impl Item {
         )
     }
 
-    /// Create a message indicating the task is done
+    /// Create a message indicating the task is done.
+    ///
+    /// The item enters the terminal [`State::Completed`] state: progress can no longer move
+    /// backwards and the item cannot be reopened.
     pub fn done(&mut self, message: impl Into<String>) {
+        self.alter_progress(|p| p.state = State::Completed);
         self.message(MessageLevel::Success, message)
     }
 
@@ -332,16 +400,6 @@ impl Item {
     /// Create a message providing additional information about the progress thus far.
     pub fn info(&mut self, message: impl Into<String>) {
         self.message(MessageLevel::Info, message)
-    }
-
-    pub(crate) fn deep_clone(&self) -> Item {
-        Item {
-            key: self.key,
-            value: Arc::new(AtomicUsize::new(self.value.load(Ordering::SeqCst))),
-            highest_child_id: self.highest_child_id,
-            tree: Arc::new(self.tree.deref().clone()),
-            messages: Arc::new(Mutex::new(self.messages.lock().clone())),
-        }
     }
 }
 

@@ -52,6 +52,22 @@ impl Mode {
 
 /// initialization and modification
 impl Mode {
+    /// Reconstruct a mode from its serializable parts.
+    #[cfg(feature = "snapshot")]
+    pub(crate) fn from_parts(location: Location, percent: bool, throughput: bool) -> Self {
+        Mode {
+            location,
+            percent,
+            throughput,
+        }
+    }
+
+    /// Decompose the mode into its serializable parts.
+    #[cfg(feature = "snapshot")]
+    pub(crate) fn parts(self) -> (Location, bool, bool) {
+        (self.location, self.percent, self.throughput)
+    }
+
     /// Create a mode instance with percentage only.
     pub fn with_percentage() -> Self {
         Mode {

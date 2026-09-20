@@ -108,6 +108,29 @@ pub fn dynamic_and_mode(label: impl DisplayValue + Send + Sync + 'static, mode: 
 
 /// Display and utilities
 impl Unit {
+    #[cfg(feature = "snapshot")]
+    pub(crate) fn label_str(&self) -> Option<&'static str> {
+        match self.kind {
+            Kind::Label(label) => Some(label),
+            Kind::Dynamic(_) => None,
+        }
+    }
+
+    #[cfg(feature = "snapshot")]
+    pub(crate) fn mode(&self) -> Option<display::Mode> {
+        self.mode
+    }
+
+    /// Reconstruct a statically known unit from its serializable parts.
+    /// Returns `None` for dynamic units, which cannot be serialized.
+    #[cfg(feature = "snapshot")]
+    pub(crate) fn from_label(label: &'static str, mode: Option<display::Mode>) -> Unit {
+        Unit {
+            kind: Kind::Label(label),
+            mode,
+        }
+    }
+
     /// Create a representation of `self` implementing [`Display`][std::fmt::Display] in configurable fashion.
     ///
     /// * `current_value` is the progress value to display.

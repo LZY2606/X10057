@@ -1,14 +1,14 @@
 use std::{
     ops::Deref,
-    sync::{Arc, Weak, atomic::AtomicUsize},
+    sync::{Arc, Weak},
 };
 
 use parking_lot::Mutex;
 
 use crate::{
-    messages::{Message, MessageCopyState, MessageRingBuffer},
+    messages::{Message, MessageCopyState},
     progress::{Id, Key, Task},
-    tree::{Item, Root},
+    tree::{Item, Root, Shared},
 };
 
 impl Root {
@@ -22,20 +22,13 @@ impl Root {
 
     /// Returns the maximum amount of messages we can keep before overwriting older ones.
     pub fn messages_capacity(&self) -> usize {
-        self.inner.lock().messages.lock().buf.capacity()
+        self.shared.messages.lock().buf.capacity()
     }
 
     /// Returns the current amount of `Item`s stored in the tree.
     /// **Note** that this is at most a guess as tasks can be added and removed in parallel.
     pub fn num_tasks(&self) -> usize {
-        #[cfg(feature = "progress-tree-hp-hashmap")]
-        {
-            self.inner.lock().tree.len()
-        }
-        #[cfg(not(feature = "progress-tree-hp-hashmap"))]
-        {
-            self.inner.lock().tree.len()
-        }
+        self.shared.tree.len()
     }
 
     /// Adds a new child `tree::Item`, whose parent is this instance, with the given `name`.
@@ -59,30 +52,49 @@ impl Root {
     pub fn sorted_snapshot(&self, out: &mut Vec<(Key, Task)>) {
         out.clear();
         #[cfg(feature = "progress-tree-hp-hashmap")]
-        out.extend(self.inner.lock().tree.iter().map(|r| (*r.key(), r.value().clone())));
+        out.extend(self.shared.tree.iter().map(|r| (*r.key(), r.value().clone())));
         #[cfg(not(feature = "progress-tree-hp-hashmap"))]
-        self.inner.lock().tree.extend_to(out);
+        self.shared.tree.extend_to(out);
         out.sort_by_key(|t| t.0);
     }
 
     /// Copy all messages from the internal ring buffer into the given `out`
     /// vector. Messages are ordered from oldest to newest.
     pub fn copy_messages(&self, out: &mut Vec<Message>) {
-        self.inner.lock().messages.lock().copy_all(out);
+        self.shared.messages.lock().copy_all(out);
     }
 
     /// Copy only new messages from the internal ring buffer into the given `out`
     /// vector. Messages are ordered from oldest to newest.
     pub fn copy_new_messages(&self, out: &mut Vec<Message>, prev: Option<MessageCopyState>) -> MessageCopyState {
-        self.inner.lock().messages.lock().copy_new(out, prev)
+        self.shared.messages.lock().copy_new(out, prev)
     }
 
     /// Duplicate all content and return it.
     ///
     /// This is an expensive operation, whereas `clone()` is not as it is shallow.
+    ///
+    /// The duplicate is an independent tree: restoring a snapshot on it does not invalidate
+    /// handles of the original tree.
     pub fn deep_clone(&self) -> Arc<Root> {
+        let shared = Arc::new(self.shared.duplicate());
+        let root_item = {
+            let item = self.inner.lock();
+            Item {
+                key: item.key,
+                value: Arc::clone(&item.value),
+                highest_child_id: item.highest_child_id,
+                shared: Arc::clone(&shared),
+                generation: 0,
+            }
+        };
+        Root::from_parts(root_item, shared)
+    }
+
+    pub(crate) fn from_parts(inner: Item, shared: Arc<Shared>) -> Arc<Root> {
         Arc::new(Root {
-            inner: Mutex::new(self.inner.lock().deep_clone()),
+            inner: Mutex::new(inner),
+            shared,
         })
     }
 }
@@ -130,14 +142,17 @@ impl From<Options> for Root {
             message_buffer_capacity,
         }: Options,
     ) -> Self {
+        let shared = Arc::new(Shared::with_capacity(initial_capacity, message_buffer_capacity));
+        let root_item = Item {
+            highest_child_id: 0,
+            value: Default::default(),
+            key: Key::default(),
+            shared: Arc::clone(&shared),
+            generation: 0,
+        };
         Root {
-            inner: Mutex::new(Item {
-                highest_child_id: 0,
-                value: Arc::new(AtomicUsize::default()),
-                key: Key::default(),
-                tree: Arc::new(crate::tree::HashMap::with_capacity(initial_capacity)),
-                messages: Arc::new(Mutex::new(MessageRingBuffer::with_capacity(message_buffer_capacity))),
-            }),
+            inner: Mutex::new(root_item),
+            shared,
         }
     }
 }

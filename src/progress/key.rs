@@ -106,6 +106,46 @@ impl IndexMut<Level> for Adjacency {
 }
 
 impl Key {
+    #[cfg(feature = "snapshot")]
+    pub(crate) fn components(self) -> [Option<Id>; 6] {
+        let Key(a, b, c, d, e, f) = self;
+        [a, b, c, d, e, f]
+    }
+
+    /// Build a key from path components. Returns `None` if the path has a hole (an absent
+    /// component followed by a present one), which is never produced by `add_child`.
+    #[cfg(feature = "snapshot")]
+    pub(crate) fn from_components(components: [Option<Id>; 6]) -> Option<Key> {
+        let [a, b, c, d, e, f] = components;
+        let ordered = [a, b, c, d, e, f];
+        let mut seen_hole = false;
+        for component in ordered {
+            if component.is_none() {
+                seen_hole = true;
+            } else if seen_hole {
+                return None;
+            }
+        }
+        Some(Key(a, b, c, d, e, f))
+    }
+
+    /// Build a key from up to six hierarchy levels, each level being the child position assigned
+    /// by `add_child`. More than six levels collapse onto level six.
+    #[cfg(feature = "snapshot")]
+    pub fn from_levels(levels: &[u16]) -> Key {
+        let mut components = [None; 6];
+        for (slot, level) in components.iter_mut().zip(levels.iter()) {
+            *slot = Some(*level);
+        }
+        Key::from_components(components).expect("a dense prefix never contains a hole")
+    }
+
+    /// Return the hierarchy levels of this key, i.e. the child position at each level.
+    #[cfg(feature = "snapshot")]
+    pub fn levels(&self) -> Vec<u16> {
+        self.components().iter().flatten().copied().collect()
+    }
+
     /// Return the key to the child identified by `child_id` located in a new nesting level below `self`.
     pub fn add_child(self, child_id: Id) -> Key {
         match self {

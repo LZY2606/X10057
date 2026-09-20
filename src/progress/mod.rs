@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -44,17 +45,31 @@ pub type AtomicStep = AtomicUsize;
 pub type StepShared = Arc<AtomicStep>;
 
 /// Indicate whether a progress can or cannot be made.
-#[derive(Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
+#[derive(Default, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
 pub enum State {
     /// Indicates a task is blocked and cannot indicate progress, optionally until the
     /// given time. The task cannot easily be interrupted.
-    Blocked(&'static str, Option<SystemTime>),
+    Blocked(Cow<'static, str>, Option<SystemTime>),
     /// Indicates a task cannot indicate progress, optionally until the
     /// given time. The task can be interrupted.
-    Halted(&'static str, Option<SystemTime>),
+    Halted(Cow<'static, str>, Option<SystemTime>),
     /// The task is running
     #[default]
     Running,
+    /// The task completed successfully and cannot be reopened.
+    ///
+    /// This is a terminal state: subsequent `init`, `set`, `inc*`, `running`,
+    /// `blocked` or `halted` calls will not alter it, and monotonic snapshot
+    /// merges keep it sticky. It is entered by [`crate::tree::Item::done`].
+    Completed,
+}
+
+impl State {
+    /// Return true if this state is terminal, i.e. the task is finished and
+    /// must not transition back to any other state.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, State::Completed)
+    }
 }
 
 /// Progress associated with some item in the progress tree.

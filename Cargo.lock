@@ -1239,6 +1239,8 @@ dependencies = [
  "parking_lot",
  "rand",
  "ratatui",
+ "serde",
+ "serde_json",
  "signal-hook 0.4.4",
  "tui-react",
  "unicode-segmentation",

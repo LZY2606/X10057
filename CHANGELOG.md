@@ -5,6 +5,93 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Feature: resumable snapshots and monotonic merges for the progress tree
+
+The `snapshot` feature (off by default, enabled in `--all-features`) adds a serializable
+representation of a nested progress tree together with restore and monotonic merge operations:
+
+* `tree::Root::snapshot()` captures every task — hierarchy position, name, stable id, current
+  step, upper bound, static unit and lifecycle state — and the still-retained messages.
+* `tree::Root::restore()` continues a tree from a snapshot on a fresh `Root`. It carries the
+  snapshot's tree identity and **invalidates every handle of the previous tree**: old `Root` and
+  `tree::Item` handles are detached and can no longer mutate the restored tree (their `set`,
+  `inc*`, `init`, `set_name`, state changes, messages and `add_child` calls are no-ops against it).
+* `tree::Root::merge()` folds a snapshot into a live tree **monotonically**: per-item steps only
+  move forward (the maximum wins), upper bounds only grow, and the new terminal
+  `progress::State::Completed` is sticky. `Item::done()` enters that terminal state; completed
+  items cannot be reopened by later handle calls or snapshot replays.
+* Trees carry a 16 byte identity (`tree::TreeId`). Snapshots from unrelated trees are rejected by
+  both `restore` and `merge` with `TreeIdMismatch` errors, preventing accidental id collisions
+  between two different progress trees whose positional keys (`Key`) happen to overlap.
+  `tree::root::Options::create_with_tree_id` lets a process recreate the same identity after a
+  restart.
+* `tree::snapshot::FixedClock` is an injectable, shareable clock for message timestamps, so
+  snapshots taken with it have byte-reproducible serialized output (JSON demonstrated in tests).
+* All failures are reported through the diagnostic `snapshot::RestoreError` and
+  `snapshot::MergeError` enums (`UnsupportedVersion`, `Malformed`, `TreeIdMismatch`), including
+  the offending identities/fields in their `Display` output.
+
+#### Implementation notes
+
+* Shared state moved into a `tree::Shared` struct holding the task map, message ring buffer and
+  an `AtomicU64` generation counter; `Item` handles store the generation they were minted in. A
+  restore bumps the old generation, which is an O(1) invalidation with no per-handle bookkeeping
+  and keeps the steady-state synchronization cost at the existing atomic/mutex level (the hot
+  `set`/`inc` path is still a single relaxed/seqcst atomic on an attached handle).
+* Per-parent child-id counters moved into a shared table and are pre-seeded from snapshots on
+  restore/merge, so newly allocated children never reuse a key that belongs to snapshot data.
+* `progress::State` reasons changed from `&'static str` to `Cow<'static, str>` so restored
+  (owned) reasons are representable; existing call sites passing `&'static str` compile
+  unchanged. A new `State::Completed` variant was appended at the end to preserve discriminant
+  ordering; renderers treat it like a finished, non-blocked task.
+* Static label units (including their display `Mode`) round-trip; dynamic units, which carry
+  closures and cannot cross process boundaries, are dropped during encoding.
+* The message ring gained `push_overwrite_at` (explicit timestamp) and `contains`; merging
+  appends only messages not already present, preserving original timestamps and ring order.
+* Default features, method ordering and existing boundary behavior are unchanged: without the
+  `snapshot` feature no new dependencies or public items are compiled in, `init(None, None)`
+  still denotes an organizational unit, and `Root::new`/`Options` defaults are untouched.
+
+#### Coverage that was previously missing (new regression tests)
+
+* `tests/snapshot.rs::restore_round_trips_every_field` — full state round trip including units,
+  stable ids, nested keys, terminal state and message origin/text/timestamp order.
+* `tests/snapshot.rs::old_handles_cannot_mutate_the_restored_tree` — every mutator on a
+  pre-restore handle is a no-op against the restored tree, including children created from a
+  stale handle.
+* `tests/snapshot.rs::merge_is_idempotent_for_the_same_snapshot` — replaying one snapshot twice
+  yields identical tasks, steps and messages (`MergeReport` shows inserts first, skips after).
+* `tests/snapshot.rs::merge_keeps_per_item_maximum_steps_and_sticky_terminal_state` — lower
+  snapshots cannot roll steps back; `Completed` survives stale running snapshots and direct
+  handle attempts to reopen/rewind.
+* `tests/snapshot.rs::concurrent_merges_settle_at_max_step_and_terminal_state` and
+  `concurrent_handle_increments_never_lose_the_merged_maximum` — barrier-aligned, sleep-free
+  replays of concurrent merges and atomic increments asserting the per-item maximum step and
+  sticky terminal state.
+* `tests/snapshot.rs::snapshot_bytes_are_reproducible_with_a_fixed_clock` — two independent
+  processes' worth of runs with the same fixed identity/clock produce identical JSON bytes.
+* `tests/snapshot.rs::restore_rejects_foreign_and_malformed_snapshots` /
+  `merge_rejects_foreign_tree_ids` — wrong tree id, unsupported version, bad id lengths and
+  hierarchy holes crafted in JSON are all rejected with the matching diagnostic error.
+* Unit tests in `src/tree/snapshot/codec_tests.rs` cover key/state/unit codecs, max-step merge
+  semantics and message deduplication directly.
+
+#### Most dangerous counterexample and its regression
+
+The highest-risk interleaving is: a task completes at step 10 in one replay, while a concurrent
+  (or merely delayed) handle/snapshot still believes the task is running at step 1. Two things
+  go wrong simultaneously if merging is naive: (1) an unconditional `set(1)` rolls the counter
+  backwards, and (2) overwriting the state with `Running` reopens a finished item — after which
+  every later update is accepted and the UI shows a completed task active again. A restore that
+  left old handles attached makes it worse, because the stale handle mutates the *new* tree
+  directly. The regression is
+  `tests/snapshot.rs::merge_keeps_per_item_maximum_steps_and_sticky_terminal_state` together with
+  `old_handles_cannot_mutate_the_restored_tree` and the concurrent tests above: steps are merged
+  with a per-item `fetch_max`, `Completed` is sticky in both merge and handle mutation paths, and
+  restore bumps the generation so stale handles cannot touch the new tree.
+
 ## 31.0.0 (2026-01-08)
 
 ### Chore
@@ -3285,4 +3372,3 @@ a redraw manually.
 ## v0.1.2 (2020-07-06)
 
 ## v0.1.1 (2020-07-05)
-
